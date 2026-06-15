@@ -1,4 +1,0 @@
-commit	val_mae	val_mape	status	description
-baseline	3169.20	21.64	keep	baseline (default config, 60s, merged_cars.csv 10 brands / 15599 rows)
-f385e99	2737.79	18.10	keep	LR schedule: 5pct warmup + cosine decay to 0
-34bf70f	2694.12	17.81	keep	log-transform mileage feature (RMSE 7912->6525)

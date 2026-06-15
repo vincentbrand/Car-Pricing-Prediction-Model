@@ -5,3 +5,6 @@ marktplaats_cars.csv
 car_brands.csv
 car_brands.json
 *pages.csv
+results.tsv
+run.log
+.best-car-model.py
