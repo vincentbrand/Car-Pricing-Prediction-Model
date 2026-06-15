@@ -220,6 +220,7 @@ class FeaturePipeline:
     def _raw_numeric(self, df):
         age = (REF_YEAR - df["build_year"].to_numpy(dtype=np.float32))
         mileage = df["mileage_km"].fillna(self.mileage_median).to_numpy(dtype=np.float32)
+        mileage = np.log1p(mileage)   # mileage is heavy-tailed; log-compress before standardizing
         return np.stack([age, mileage], axis=1).astype(np.float32)
 
     def transform(self, df):
