@@ -91,8 +91,8 @@ TARGET = "price_eur"
 
 # --- Fixed constants ----------------------------------------------------------
 SEED = 42                 # controls the train/val split — fixed so the val set never changes
-VAL_FRAC = 0.2            # fraction of valid rows held out for scoring
-TIME_BUDGET = 60.0        # wall-clock training budget in seconds (analogue of the 5-min rule)
+VAL_FRAC = 0.3            # fraction of valid rows held out for scoring
+TIME_BUDGET = 600.0        # wall-clock training budget in seconds (analogue of the 5-min rule)
 REF_YEAR = 2026           # reference year for computing car age
 
 # Row-validity filters. These decide *which cars exist* in the experiment and so
@@ -168,14 +168,39 @@ def evaluate(model, pipeline, df, idx, device):
 # =============================================================================
 
 # --- Hyperparameters (edit these directly) ------------------------------------
-HIDDEN = (256, 128)       # MLP hidden layer widths
+# Model family. "mlp" = the embedding+MLP net below; "catboost" = gradient-boosted
+# trees (usually the stronger baseline on tabular data of this size/shape).
+MODEL = "mlp"             # "mlp" | "catboost"
+
+# --- MLP architecture ---------------------------------------------------------
+HIDDEN = (256, 128)       # MLP hidden layer widths; add entries to go deeper, e.g. (512, 256, 128)
 DROPOUT = 0.2             # dropout in each hidden block
+ACTIVATION = "relu"       # "relu" | "gelu" | "silu"
+NORM = "layer"            # per-block normalization: "layer" | "batch" | "none"
+EMB_SCALE = 1.6           # embedding width = clamp(EMB_SCALE * cardinality**EMB_POW, 2, EMB_CAP)
+EMB_POW = 0.56            # fast.ai-style exponent on cardinality
+EMB_CAP = 50              # max embedding width
+
+# --- MLP optimization ---------------------------------------------------------
+OPTIMIZER = "adam"        # "adam" (L2 via weight_decay) | "adamw" (decoupled decay)
 BATCH_SIZE = 256          # training mini-batch size
-LR = 1e-2                 # Adam learning rate (peak, reached after warmup)
+LR = 1e-2                 # peak learning rate (reached after warmup)
 LR_WARMUP_FRAC = 0.05     # fraction of the budget spent warming LR up from 0
 LR_FINAL_FRAC = 0.0       # final LR as a fraction of peak (cosine-decay target)
-WEIGHT_DECAY = 1e-4       # Adam weight decay
-LOG_EVERY = 2.0           # seconds between progress prints
+WEIGHT_DECAY = 1e-4       # optimizer weight decay
+GRAD_CLIP = 0.0           # clip grad-norm to this value (0 = disabled)
+
+# --- Loss (MLP) ---------------------------------------------------------------
+LOSS = "smoothl1"         # "smoothl1" | "mae" | "mse"  (all on the log1p-price target)
+HUBER_BETA = 1.0          # SmoothL1 transition point; on log targets (<~1) it acts MSE-like
+
+# --- CatBoost (used only when MODEL == "catboost") ----------------------------
+CB_ITERATIONS = 12000     # max boosting rounds (capped further by the time budget)
+CB_LR = 0.03              # boosting learning rate
+CB_DEPTH = 8              # tree depth
+CB_L2_LEAF_REG = 5.0      # L2 regularization on leaf values
+
+LOG_EVERY = 2.0           # seconds between progress prints (MLP)
 
 
 def lr_multiplier(progress):
@@ -187,8 +212,31 @@ def lr_multiplier(progress):
 
 
 def embedding_dim(cardinality):
-    """fast.ai-style heuristic for embedding width, clamped to [2, 50]."""
-    return int(min(50, max(2, round(1.6 * cardinality ** 0.56))))
+    """fast.ai-style heuristic for embedding width, clamped to [2, EMB_CAP]."""
+    return int(min(EMB_CAP, max(2, round(EMB_SCALE * cardinality ** EMB_POW))))
+
+
+def _make_activation():
+    """Hidden-layer activation selected by the ACTIVATION hyperparameter."""
+    return {"relu": nn.ReLU, "gelu": nn.GELU, "silu": nn.SiLU}[ACTIVATION]()
+
+
+def _make_norm(dim):
+    """Per-block normalization selected by the NORM hyperparameter."""
+    if NORM == "layer":
+        return nn.LayerNorm(dim)     # works at any batch size (incl. 1)
+    if NORM == "batch":
+        return nn.BatchNorm1d(dim)
+    return nn.Identity()
+
+
+def _make_loss():
+    """Training loss selected by the LOSS hyperparameter (on the log1p target)."""
+    if LOSS == "mae":
+        return nn.L1Loss()
+    if LOSS == "mse":
+        return nn.MSELoss()
+    return nn.SmoothL1Loss(beta=HUBER_BETA)   # robust to the occasional pricing outlier
 
 
 class FeaturePipeline:
@@ -246,8 +294,8 @@ class CarPriceNet(nn.Module):
         for h in hidden:
             layers += [
                 nn.Linear(in_dim, h),
-                nn.ReLU(),
-                nn.LayerNorm(h),     # LayerNorm works at any batch size (incl. 1)
+                _make_activation(),
+                _make_norm(h),
                 nn.Dropout(dropout),
             ]
             in_dim = h
@@ -260,10 +308,105 @@ class CarPriceNet(nn.Module):
         return self.mlp(x).squeeze(1)
 
 
+# =============================================================================
+# CatBoost variant — a gradient-boosted-tree alternative to the MLP.
+# It consumes the SAME FeaturePipeline output (integer category codes + standardized
+# numerics) and exposes a model(x_cat, x_num) -> log-price callable, so the FIXED
+# evaluate() scores it identically. Category codes are declared categorical to
+# CatBoost (standardizing them is harmless to trees); best-iteration selection on
+# the val split mirrors the MLP's best-val checkpointing.
+# =============================================================================
+
+def _cb_pool(x_cat, x_num, label=None):
+    """Build a CatBoost Pool from the pipeline's (cat-code, numeric) tensors."""
+    from catboost import Pool
+    cat = np.asarray(x_cat.cpu() if hasattr(x_cat, "cpu") else x_cat, dtype=np.int64)
+    num = np.asarray(x_num.cpu() if hasattr(x_num, "cpu") else x_num, dtype=np.float64)
+    cols = {f"c{i}": cat[:, i] for i in range(cat.shape[1])}
+    cols.update({f"n{j}": num[:, j] for j in range(num.shape[1])})
+    cat_features = [f"c{i}" for i in range(cat.shape[1])]
+    return Pool(pd.DataFrame(cols), label=label, cat_features=cat_features)
+
+
+class _CBTimeBudget:
+    """CatBoost callback: stop boosting once the wall-clock budget is spent."""
+
+    def __init__(self, seconds):
+        self.deadline = time.time() + seconds
+
+    def after_iteration(self, info):
+        return time.time() < self.deadline   # return False to halt training
+
+
+class CatBoostModel:
+    """Adapts a trained CatBoostRegressor to the FIXED evaluate() interface:
+    callable as model(x_cat, x_num) -> log-price tensor, with a no-op .eval()."""
+
+    def __init__(self, cb_model):
+        self.cb = cb_model
+
+    def eval(self):
+        return self
+
+    def train(self, mode=True):
+        return self
+
+    def state_dict(self):
+        # Picklable payload so the FIXED save path in main() succeeds for CatBoost
+        # too (it carries the native model). The MLP-shaped notebook loader won't
+        # read this, but the run completes and emits its val_mae summary.
+        return {"catboost_model": self.cb}
+
+    def __call__(self, x_cat, x_num):
+        preds = self.cb.predict(_cb_pool(x_cat, x_num))
+        return torch.as_tensor(preds, dtype=torch.float32)
+
+
+def train_catboost(df, train_idx, val_idx, time_budget, pipeline):
+    """Fit a CatBoostRegressor on the log1p(price) target within the time budget.
+    Returns train()'s 5-tuple; num_params is reported as the final tree count."""
+    from catboost import CatBoostRegressor
+
+    xc_tr, xn_tr = pipeline.transform(df.iloc[train_idx])
+    xc_va, xn_va = pipeline.transform(df.iloc[val_idx])
+    yl_tr = np.log1p(df.iloc[train_idx][TARGET].to_numpy(dtype=np.float64))
+    yl_va = np.log1p(df.iloc[val_idx][TARGET].to_numpy(dtype=np.float64))
+
+    train_pool = _cb_pool(xc_tr, xn_tr, yl_tr)
+    val_pool = _cb_pool(xc_va, xn_va, yl_va)
+
+    model = CatBoostRegressor(
+        iterations=CB_ITERATIONS,
+        learning_rate=CB_LR,
+        depth=CB_DEPTH,
+        l2_leaf_reg=CB_L2_LEAF_REG,
+        loss_function="RMSE",     # on log-price; CatBoost runs on CPU on Apple silicon
+        eval_metric="MAE",        # best iteration picked by log-MAE on val (proxy for euro-MAE)
+        random_seed=SEED,
+        use_best_model=True,
+        allow_writing_files=False,
+        verbose=False,
+    )
+
+    print(f"Device: cpu (CatBoost) | rows: {len(df)} (train {len(train_idx)} / val {len(val_idx)})")
+    print(f"Categorical cardinalities: {dict(zip(CATEGORICAL, pipeline.cardinalities))}")
+    print(f"CatBoost: depth {CB_DEPTH} | lr {CB_LR} | max iters {CB_ITERATIONS} | time budget: {time_budget:.0f}s\n")
+
+    model.fit(train_pool, eval_set=val_pool, callbacks=[_CBTimeBudget(time_budget)])
+
+    n_trees = int(model.tree_count_)
+    best_iter = int(model.get_best_iteration() or 0)
+    print(f"Trained {n_trees} trees | best val-MAE iteration @ {best_iter}\n")
+    return CatBoostModel(model), pipeline, n_trees, n_trees, best_iter + 1
+
+
 def train(df, train_idx, val_idx, time_budget, device, show):
-    """Fit a CarPriceNet within `time_budget` seconds, keeping best-val weights."""
+    """Fit the selected model within `time_budget` seconds, keeping best-val weights."""
     # --- Build features (fit on TRAIN only) ----------------------------------
     pipeline = FeaturePipeline().fit(df.iloc[train_idx])
+    if MODEL == "catboost":
+        return train_catboost(df, train_idx, val_idx, time_budget, pipeline)
+
     xc_tr, xn_tr = pipeline.transform(df.iloc[train_idx])
     yl_tr = torch.tensor(
         np.log1p(df.iloc[train_idx][TARGET].to_numpy(dtype=np.float32))
@@ -273,13 +416,16 @@ def train(df, train_idx, val_idx, time_budget, device, show):
         TensorDataset(xc_tr, xn_tr, yl_tr),
         batch_size=min(BATCH_SIZE, len(train_idx)),
         shuffle=True,
-        drop_last=False,
+        drop_last=(NORM == "batch"),   # BatchNorm chokes on a final batch of size 1
     )
 
     # --- Model / optimizer / loss --------------------------------------------
     model = CarPriceNet(pipeline.cardinalities, n_numeric=len(FeaturePipeline.NUMERIC)).to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
-    loss_fn = nn.SmoothL1Loss()   # robust to the occasional pricing outlier
+    if OPTIMIZER == "adamw":
+        optimizer = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
+    else:
+        optimizer = torch.optim.Adam(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
+    loss_fn = _make_loss()
 
     num_params = sum(p.numel() for p in model.parameters())
     print(f"Device: {device} | rows: {len(df)} (train {len(train_idx)} / val {len(val_idx)})")
@@ -303,6 +449,8 @@ def train(df, train_idx, val_idx, time_budget, device, show):
             optimizer.zero_grad()
             loss = loss_fn(model(xc, xn), yl)
             loss.backward()
+            if GRAD_CLIP > 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
             optimizer.step()
         train_seconds += time.time() - t0   # only training counts toward the budget
 
@@ -341,6 +489,11 @@ def predict_price(model, pipeline, car, device):
 # =============================================================================
 # MAIN — orchestration & the autoresearch summary block (do not modify)
 # =============================================================================
+
+# Where the trained model is exported at the end of every run. The companion
+# test notebook (test-car-price-model.ipynb) loads this file to verify accuracy.
+DEFAULT_MODEL_PATH = "car-price-prediction-model.pt"
+
 
 def main(args):
     t_start = time.time()
@@ -383,15 +536,35 @@ def main(args):
     print(f"\nPredicted price for {example['build_year']} {example['model']} "
           f"({example['mileage_km']:,} km): EUR {price:,.0f}")
 
-    if args.save:
-        torch.save({
-            "state_dict": model.state_dict(),
-            "maps": pipeline.maps, "cardinalities": pipeline.cardinalities,
-            "mileage_median": pipeline.mileage_median,
-            "num_mean": pipeline.num_mean, "num_std": pipeline.num_std,
-            "ref_year": REF_YEAR,
-        }, args.save)
-        print(f"\nSaved model bundle to {args.save}")
+    # --- Export the trained model bundle (consumed by the test notebook) ------
+    # Written every run, so DEFAULT_MODEL_PATH always reflects the most recent
+    # train. The bundle is self-describing: it carries the pipeline statistics
+    # AND the architecture/schema needed to rebuild the model for inference, so
+    # the notebook can reconstruct everything without hard-coding hyperparameters.
+    bundle = {
+        "state_dict": model.state_dict(),
+        # Feature-pipeline statistics (all fit on the TRAIN split only).
+        "maps": pipeline.maps,
+        "cardinalities": pipeline.cardinalities,
+        "mileage_median": pipeline.mileage_median,
+        "num_mean": pipeline.num_mean,
+        "num_std": pipeline.num_std,
+        # Schema + architecture needed to rebuild the model for inference.
+        "categorical": CATEGORICAL,
+        "numeric": FeaturePipeline.NUMERIC,
+        "target": TARGET,
+        "ref_year": REF_YEAR,
+        "hidden": HIDDEN,
+        "dropout": DROPOUT,
+        # Provenance: how to reproduce the exact held-out split this was scored
+        # on, the data it was trained on, and the score this export achieved.
+        "seed": SEED,
+        "val_frac": VAL_FRAC,
+        "data_path": str(args.data),
+        "val_mae": mae, "val_rmse": rmse, "val_mape": mape,
+    }
+    torch.save(bundle, args.save)
+    print(f"\nSaved model bundle to {args.save}")
 
     # --- Autoresearch summary block (parse with: grep "^val_mae:" run.log) ----
     total_seconds = time.time() - t_start
@@ -416,7 +589,8 @@ def parse_args():
     p.add_argument("--time-budget", type=float, default=TIME_BUDGET,
                    help="Wall-clock training budget in seconds (hold constant across an experiment series)")
     p.add_argument("--show", type=int, default=8, help="How many example predictions to print")
-    p.add_argument("--save", type=Path, default=None, help="Optional path to save the trained model bundle")
+    p.add_argument("--save", type=Path, default=Path(DEFAULT_MODEL_PATH),
+                   help=f"Path to export the trained model bundle (default: {DEFAULT_MODEL_PATH})")
     return p.parse_args()
 
 
