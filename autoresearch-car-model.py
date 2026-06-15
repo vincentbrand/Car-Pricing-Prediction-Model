@@ -191,14 +191,18 @@ WEIGHT_DECAY = 1e-4       # optimizer weight decay
 GRAD_CLIP = 0.0           # clip grad-norm to this value (0 = disabled)
 
 # --- Loss (MLP) ---------------------------------------------------------------
-LOSS = "smoothl1"         # "smoothl1" | "mae" | "mse"  (all on the log1p-price target)
-HUBER_BETA = 1.0          # SmoothL1 transition point; on log targets (<~1) it acts MSE-like
+LOSS = "mae"              # "smoothl1" | "mae" | "mse"
+LOSS_SPACE = "euro"       # "log" = loss on log1p target (relative err) | "euro" = on expm1 (matches val_mae)
+HUBER_BETA = 1.0          # SmoothL1 transition point, in the CHOSEN space (euro space needs a large beta)
+
+# --- Robustness / ensembling --------------------------------------------------
+N_SEEDS = 1               # MLP inits trained on the SAME split; >1 prints mean±std and ensembles them
 
 # --- CatBoost (used only when MODEL == "catboost") ----------------------------
-CB_ITERATIONS = 12000     # max boosting rounds (capped further by the time budget)
-CB_LR = 0.03              # boosting learning rate
-CB_DEPTH = 8              # tree depth
-CB_L2_LEAF_REG = 5.0      # L2 regularization on leaf values
+CB_ITERATIONS = 20000     # max boosting rounds (capped further by the time budget)
+CB_LR = 0.02              # boosting learning rate
+CB_DEPTH = 6              # tree depth
+CB_L2_LEAF_REG = 10.0     # L2 regularization on leaf values
 
 LOG_EVERY = 2.0           # seconds between progress prints (MLP)
 
@@ -308,6 +312,20 @@ class CarPriceNet(nn.Module):
         return self.mlp(x).squeeze(1)
 
 
+class EnsembleModel(nn.Module):
+    """Averages several CarPriceNets' predictions in EURO space, then re-logs so the
+    FIXED evaluate() inverts back to the arithmetic-mean price. As an nn.Module it
+    satisfies the harness interface (.eval(), .state_dict(), callable) unchanged."""
+
+    def __init__(self, members):
+        super().__init__()
+        self.members = nn.ModuleList(members)
+
+    def forward(self, x_cat, x_num):
+        euro = torch.stack([torch.expm1(m(x_cat, x_num)) for m in self.members], dim=0).mean(0)
+        return torch.log1p(torch.clamp(euro, min=0.0))
+
+
 # =============================================================================
 # CatBoost variant — a gradient-boosted-tree alternative to the MLP.
 # It consumes the SAME FeaturePipeline output (integer category codes + standardized
@@ -400,17 +418,11 @@ def train_catboost(df, train_idx, val_idx, time_budget, pipeline):
     return CatBoostModel(model), pipeline, n_trees, n_trees, best_iter + 1
 
 
-def train(df, train_idx, val_idx, time_budget, device, show):
-    """Fit the selected model within `time_budget` seconds, keeping best-val weights."""
-    # --- Build features (fit on TRAIN only) ----------------------------------
-    pipeline = FeaturePipeline().fit(df.iloc[train_idx])
-    if MODEL == "catboost":
-        return train_catboost(df, train_idx, val_idx, time_budget, pipeline)
-
-    xc_tr, xn_tr = pipeline.transform(df.iloc[train_idx])
-    yl_tr = torch.tensor(
-        np.log1p(df.iloc[train_idx][TARGET].to_numpy(dtype=np.float32))
-    )
+def _train_one(seed, df, train_idx, val_idx, time_budget, device, pipeline,
+               xc_tr, xn_tr, yl_tr, verbose):
+    """Train ONE CarPriceNet from init `seed` (the split is fixed independently of
+    this seed). Returns (best_val_model, best_mae, epochs_run, best_epoch)."""
+    torch.manual_seed(seed)   # varies init + shuffle only; never the train/val split
 
     train_loader = DataLoader(
         TensorDataset(xc_tr, xn_tr, yl_tr),
@@ -427,11 +439,6 @@ def train(df, train_idx, val_idx, time_budget, device, show):
         optimizer = torch.optim.Adam(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
     loss_fn = _make_loss()
 
-    num_params = sum(p.numel() for p in model.parameters())
-    print(f"Device: {device} | rows: {len(df)} (train {len(train_idx)} / val {len(val_idx)})")
-    print(f"Categorical cardinalities: {dict(zip(CATEGORICAL, pipeline.cardinalities))}")
-    print(f"Model params: {num_params:,} | time budget: {time_budget:.0f}s\n")
-
     # --- Training loop (fixed wall-clock budget, best-val checkpoint) ---------
     best_mae, best_state, best_epoch = float("inf"), None, 0
     train_seconds, epoch, last_log = 0.0, 0, 0.0
@@ -447,7 +454,15 @@ def train(df, train_idx, val_idx, time_budget, device, show):
         for xc, xn, yl in train_loader:
             xc, xn, yl = xc.to(device), xn.to(device), yl.to(device)
             optimizer.zero_grad()
-            loss = loss_fn(model(xc, xn), yl)
+            out = model(xc, xn)
+            # Metric alignment: the north-star metric is euro-MAE, but log-space loss
+            # optimizes relative error. In "euro" mode, invert log1p so the loss is
+            # measured in euros — exactly the metric (at the cost of up-weighting
+            # expensive cars; usually needs LR/HUBER_BETA retuning).
+            if LOSS_SPACE == "euro":
+                loss = loss_fn(torch.expm1(out), torch.expm1(yl))
+            else:
+                loss = loss_fn(out, yl)
             loss.backward()
             if GRAD_CLIP > 0:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
@@ -460,16 +475,59 @@ def train(df, train_idx, val_idx, time_budget, device, show):
             best_mae, best_epoch = mae, epoch
             best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
 
-        if train_seconds - last_log >= LOG_EVERY:
+        if verbose and train_seconds - last_log >= LOG_EVERY:
             last_log = train_seconds
             print(f"epoch {epoch:5d} | {train_seconds:5.1f}s/{time_budget:.0f}s | lr {LR*lrm:.1e} | "
                   f"val MAE EUR {mae:,.0f} | RMSE EUR {rmse:,.0f} | MAPE {mape:.1f}% "
                   f"(best MAE EUR {best_mae:,.0f} @ epoch {best_epoch})")
 
-    # Restore best-val weights before final scoring / prediction.
     if best_state is not None:
         model.load_state_dict(best_state)
-    return model, pipeline, num_params, epoch, best_epoch
+    return model, best_mae, epoch, best_epoch
+
+
+def train(df, train_idx, val_idx, time_budget, device, show):
+    """Fit the selected model within `time_budget` seconds (per seed), keeping
+    best-val weights. With N_SEEDS > 1 it trains several inits on the SAME split,
+    prints their mean±std (the init-noise band, so a real change can be told from
+    noise), and returns their euro-space ensemble."""
+    # --- Build features (fit on TRAIN only) ----------------------------------
+    pipeline = FeaturePipeline().fit(df.iloc[train_idx])
+    if MODEL == "catboost":
+        return train_catboost(df, train_idx, val_idx, time_budget, pipeline)
+
+    xc_tr, xn_tr = pipeline.transform(df.iloc[train_idx])
+    yl_tr = torch.tensor(
+        np.log1p(df.iloc[train_idx][TARGET].to_numpy(dtype=np.float32))
+    )
+
+    probe = CarPriceNet(pipeline.cardinalities, n_numeric=len(FeaturePipeline.NUMERIC))
+    params_each = sum(p.numel() for p in probe.parameters())
+    print(f"Device: {device} | rows: {len(df)} (train {len(train_idx)} / val {len(val_idx)})")
+    print(f"Categorical cardinalities: {dict(zip(CATEGORICAL, pipeline.cardinalities))}")
+    print(f"Model params: {params_each:,} x {N_SEEDS} seed(s) | loss {LOSS}/{LOSS_SPACE} | "
+          f"budget {time_budget:.0f}s/seed\n")
+
+    models, maes, epochs, best_epochs = [], [], [], []
+    for i in range(N_SEEDS):
+        if N_SEEDS > 1:
+            print(f"--- seed {SEED + i} ({i + 1}/{N_SEEDS}) ---")
+        m, bmae, ep, bep = _train_one(
+            SEED + i, df, train_idx, val_idx, time_budget, device, pipeline,
+            xc_tr, xn_tr, yl_tr, verbose=(i == 0),
+        )
+        models.append(m); maes.append(bmae); epochs.append(ep); best_epochs.append(bep)
+        if N_SEEDS > 1:
+            print(f"seed {SEED + i}: best val MAE EUR {bmae:,.0f} @ epoch {bep}\n")
+
+    if N_SEEDS > 1:
+        arr = np.array(maes)
+        print(f"{N_SEEDS}-seed val MAE  mean EUR {arr.mean():,.0f} | std EUR {arr.std():,.0f} "
+              f"| min EUR {arr.min():,.0f} | max EUR {arr.max():,.0f}  (ensemble scored below)\n")
+
+    model = models[0] if N_SEEDS == 1 else EnsembleModel(models).to(device)
+    best_seed = int(np.argmin(maes))
+    return model, pipeline, params_each * N_SEEDS, sum(epochs), best_epochs[best_seed]
 
 
 def predict_price(model, pipeline, car, device):
