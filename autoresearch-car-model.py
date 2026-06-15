@@ -168,7 +168,7 @@ def evaluate(model, pipeline, df, idx, device):
 # =============================================================================
 
 # --- Hyperparameters (edit these directly) ------------------------------------
-HIDDEN = (128, 64)        # MLP hidden layer widths
+HIDDEN = (256, 128)       # MLP hidden layer widths
 DROPOUT = 0.2             # dropout in each hidden block
 BATCH_SIZE = 64           # training mini-batch size
 LR = 1e-2                 # Adam learning rate (peak, reached after warmup)
