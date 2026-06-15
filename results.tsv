@@ -1,0 +1,2 @@
+commit	val_mae	val_mape	status	description
+baseline	3169.20	21.64	keep	baseline (default config, 60s, merged_cars.csv 10 brands / 15599 rows)

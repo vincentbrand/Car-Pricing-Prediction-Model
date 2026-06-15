@@ -1,0 +1,24 @@
+[project]
+name = "carprices-datascraper"
+version = "0.1.0"
+description = "Scrape used-car listings from Marktplaats into a CSV"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+    "matplotlib>=3.9.4",
+    "numpy>=2.0.2",
+    "pandas>=2.3.3",
+    "requests>=2.31",
+    "seaborn>=0.13.2",
+    "torch>=2.8.0",
+]
+
+# Treat this as a virtual project: uv installs the dependencies into a venv
+# but does not try to build `scraper.py` as an installable package.
+[tool.uv]
+package = false
+
+[dependency-groups]
+dev = [
+    "ipykernel>=6.31.0",
+]

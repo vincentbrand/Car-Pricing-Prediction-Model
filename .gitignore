@@ -1,0 +1,7 @@
+.venv/
+__pycache__/
+*.pyc
+marktplaats_cars.csv
+car_brands.csv
+car_brands.json
+*pages.csv
