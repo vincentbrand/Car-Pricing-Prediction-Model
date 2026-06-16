@@ -258,7 +258,7 @@ class FeaturePipeline:
     # the schema's CATEGORICAL as one extra embedding.
     CAT_EXTRA = ["engine_code"]
     NUMERIC = ["age", "log_mileage", "displacement", "has_displacement",
-               "power_pk", "has_power", "n_options", "awd"]
+               "power_pk", "has_power", "n_options", "awd", "sport"]
 
     # Premium-option keywords; their count is a cheap "how loaded" proxy. Substring
     # matches on purpose ("pano" catches "panoramadak", "navi" -> "navigatie").
@@ -286,6 +286,10 @@ class FeaturePipeline:
         power = pk.fillna(kw * 1.36)                                        # kW -> metric hp
         n_opt = sum(t.str.contains(w, regex=False) for w in self.OPTION_WORDS)
         awd = t.str.contains(r"quattro|4matic|xdrive|4motion|allrad|4wd|\bawd\b", regex=True)
+        # Sport / premium trim tokens — a strong within-model price tier signal.
+        sport = t.str.contains(
+            r"m[\s-]?sport|st[\s-]?line|r[\s-]?line|s[\s-]?line|n[\s-]?line"
+            r"|\bamg\b|\bgti\b|\bgtd\b|veloce|\brs\s?\d|black edition", regex=True)
         conds = [t.str.contains(c, regex=False) for c in self.ENGINE_CODES]
         engine_code = np.select(conds, self.ENGINE_CODES, default="none")
         return {
@@ -293,6 +297,7 @@ class FeaturePipeline:
             "power_pk": power,
             "n_options": np.asarray(n_opt, dtype=np.float32),
             "awd": awd.to_numpy(dtype=np.float32),
+            "sport": sport.to_numpy(dtype=np.float32),
             "engine_code": engine_code,
         }
 
@@ -337,7 +342,7 @@ class FeaturePipeline:
         has_power = power.notna().to_numpy(dtype=np.float32)
         power = power.fillna(self.power_median).to_numpy(dtype=np.float32)
         feats = [age, mileage, disp, has_disp, power, has_power,
-                 parsed["n_options"], parsed["awd"]]
+                 parsed["n_options"], parsed["awd"], parsed["sport"]]
         return np.stack(feats, axis=1).astype(np.float32)
 
     def transform(self, df):
