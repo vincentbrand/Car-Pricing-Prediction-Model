@@ -196,7 +196,7 @@ LOSS_SPACE = "euro"       # "log" = loss on log1p target (relative err) | "euro"
 HUBER_BETA = 1.0          # SmoothL1 transition point, in the CHOSEN space (euro space needs a large beta)
 
 # --- Robustness / ensembling --------------------------------------------------
-N_SEEDS = 1               # MLP inits trained on the SAME split; >1 prints mean±std and ensembles them
+N_SEEDS = 3               # MLP inits trained on the SAME split; >1 prints mean±std and ensembles them
 
 # --- CatBoost (used only when MODEL == "catboost") ----------------------------
 CB_ITERATIONS = 20000     # max boosting rounds (capped further by the time budget)
@@ -267,6 +267,11 @@ class FeaturePipeline:
                     "airco", "cruise", "pdc", "acc", "head-up", "virtual", "led"]
     # Engine-code classes, tested in this priority order (first hit wins).
     ENGINE_CODES = ["tfsi", "tsi", "tdi", "hdi", "dci"]
+
+    @property
+    def n_numeric(self):
+        """Width of the numeric block (kept in sync with NUMERIC for model builders)."""
+        return len(self.NUMERIC)
 
     def _parse_title(self, df):
         """Vectorized extraction of title signals. Robust to a missing title column
