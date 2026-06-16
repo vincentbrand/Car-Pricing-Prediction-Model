@@ -196,7 +196,7 @@ LOSS_SPACE = "euro"       # "log" = loss on log1p target (relative err) | "euro"
 HUBER_BETA = 1.0          # SmoothL1 transition point, in the CHOSEN space (euro space needs a large beta)
 
 # --- Robustness / ensembling --------------------------------------------------
-N_SEEDS = 3               # MLP inits trained on the SAME split; >1 prints mean±std and ensembles them
+N_SEEDS = 1               # MLP inits trained on the SAME split; >1 prints mean±std and ensembles them
 
 # --- CatBoost (used only when MODEL == "catboost") ----------------------------
 CB_ITERATIONS = 20000     # max boosting rounds (capped further by the time budget)
@@ -246,38 +246,100 @@ def _make_loss():
 class FeaturePipeline:
     """Turns cleaned rows into (categorical-index, numeric) tensors.
 
-    All statistics (category vocab, mileage median, numeric mean/std) are fit on
-    the TRAIN rows only and then reused at transform time — this is the editable
-    place to invent features, but the no-leakage rule is non-negotiable.
+    All statistics (category vocab, title/mileage medians, numeric mean/std) are fit
+    on the TRAIN rows only and reused at transform time — this is the editable place
+    to invent features, but the no-leakage rule is non-negotiable. Several features
+    are parsed out of the free-text `title`: engine displacement, power, AWD, an
+    options-richness count and an engine-code class. Brand/model/year tokens in the
+    title are ignored on purpose — they only duplicate the structured columns.
     """
 
-    NUMERIC = ["age", "mileage_km"]   # numeric feature columns (derived below)
+    # `engine_code` is DERIVED from the title (not a raw column); it rides alongside
+    # the schema's CATEGORICAL as one extra embedding.
+    CAT_EXTRA = ["engine_code"]
+    NUMERIC = ["age", "log_mileage", "displacement", "has_displacement",
+               "power_pk", "has_power", "n_options", "awd"]
+
+    # Premium-option keywords; their count is a cheap "how loaded" proxy. Substring
+    # matches on purpose ("pano" catches "panoramadak", "navi" -> "navigatie").
+    OPTION_WORDS = ["leder", "pano", "navi", "camera", "bose", "matrix", "adaptive",
+                    "trekhaak", "stoelverw", "keyless", "memory", "carplay", "clima",
+                    "airco", "cruise", "pdc", "acc", "head-up", "virtual", "led"]
+    # Engine-code classes, tested in this priority order (first hit wins).
+    ENGINE_CODES = ["tfsi", "tsi", "tdi", "hdi", "dci"]
+
+    def _parse_title(self, df):
+        """Vectorized extraction of title signals. Robust to a missing title column
+        (predict_price passes none) and to mid-word truncation in scraped titles."""
+        if "title" in df.columns:
+            t = df["title"].fillna("").astype(str).str.lower()
+        else:
+            t = pd.Series([""] * len(df), index=df.index)
+        disp = t.str.extract(r"\b(\d\.\d)\b", expand=False).astype(float)   # 2.0, 1.2 ...
+        pk = t.str.extract(r"(\d+)\s*pk", expand=False).astype(float)
+        kw = t.str.extract(r"(\d+)\s*kw", expand=False).astype(float)
+        power = pk.fillna(kw * 1.36)                                        # kW -> metric hp
+        n_opt = sum(t.str.contains(w, regex=False) for w in self.OPTION_WORDS)
+        awd = t.str.contains(r"quattro|4matic|xdrive|4motion|allrad|4wd|\bawd\b", regex=True)
+        conds = [t.str.contains(c, regex=False) for c in self.ENGINE_CODES]
+        engine_code = np.select(conds, self.ENGINE_CODES, default="none")
+        return {
+            "displacement": disp,
+            "power_pk": power,
+            "n_options": np.asarray(n_opt, dtype=np.float32),
+            "awd": awd.to_numpy(dtype=np.float32),
+            "engine_code": engine_code,
+        }
+
+    def _augment(self, df):
+        """Attach the derived `engine_code` categorical column."""
+        out = df.copy()
+        out["engine_code"] = self._parse_title(df)["engine_code"]
+        return out
 
     def fit(self, train_df):
-        # Category value -> index; index 0 is reserved for unseen/unknown values
-        # so the model degrades gracefully on cars it never saw in training.
-        self.maps = {}
-        for col in CATEGORICAL:
-            cats = sorted(train_df[col].unique())
-            self.maps[col] = {c: i + 1 for i, c in enumerate(cats)}
-        self.cardinalities = [len(self.maps[c]) + 1 for c in CATEGORICAL]
-
-        # Mileage imputation value (train median), then numeric standardization.
+        parsed = self._parse_title(train_df)
+        # Train medians for the sparse title numerics (a flag marks imputed rows).
+        d = parsed["displacement"]
+        p = parsed["power_pk"]
+        self.disp_median = float(np.nanmedian(d)) if d.notna().any() else 0.0
+        self.power_median = float(np.nanmedian(p)) if p.notna().any() else 0.0
         self.mileage_median = float(train_df["mileage_km"].median())
+
+        # Category value -> index; index 0 is reserved for unseen/unknown values so
+        # the model degrades gracefully on cars (and engine codes) it never saw.
+        aug = self._augment(train_df)
+        self.cat_cols = CATEGORICAL + self.CAT_EXTRA
+        self.maps = {}
+        for col in self.cat_cols:
+            cats = sorted(aug[col].astype(str).unique())
+            self.maps[col] = {c: i + 1 for i, c in enumerate(cats)}
+        self.cardinalities = [len(self.maps[c]) + 1 for c in self.cat_cols]
+
         num = self._raw_numeric(train_df)
         self.num_mean = num.mean(axis=0)
         self.num_std = num.std(axis=0) + 1e-6
         return self
 
     def _raw_numeric(self, df):
+        parsed = self._parse_title(df)
         age = (REF_YEAR - df["build_year"].to_numpy(dtype=np.float32))
-        mileage = df["mileage_km"].fillna(self.mileage_median).to_numpy(dtype=np.float32)
-        mileage = np.log1p(mileage)   # mileage is heavy-tailed; log-compress before standardizing
-        return np.stack([age, mileage], axis=1).astype(np.float32)
+        mileage = np.log1p(df["mileage_km"].fillna(self.mileage_median).to_numpy(dtype=np.float32))
+        disp = parsed["displacement"]
+        has_disp = disp.notna().to_numpy(dtype=np.float32)
+        disp = disp.fillna(self.disp_median).to_numpy(dtype=np.float32)
+        power = parsed["power_pk"]
+        has_power = power.notna().to_numpy(dtype=np.float32)
+        power = power.fillna(self.power_median).to_numpy(dtype=np.float32)
+        feats = [age, mileage, disp, has_disp, power, has_power,
+                 parsed["n_options"], parsed["awd"]]
+        return np.stack(feats, axis=1).astype(np.float32)
 
     def transform(self, df):
+        aug = self._augment(df)
         cat = np.stack(
-            [df[col].map(lambda v: self.maps[col].get(v, 0)).to_numpy() for col in CATEGORICAL],
+            [aug[col].astype(str).map(lambda v, c=col: self.maps[c].get(v, 0)).to_numpy()
+             for col in self.cat_cols],
             axis=1,
         ).astype(np.int64)
         num = (self._raw_numeric(df) - self.num_mean) / self.num_std
@@ -407,7 +469,7 @@ def train_catboost(df, train_idx, val_idx, time_budget, pipeline):
     )
 
     print(f"Device: cpu (CatBoost) | rows: {len(df)} (train {len(train_idx)} / val {len(val_idx)})")
-    print(f"Categorical cardinalities: {dict(zip(CATEGORICAL, pipeline.cardinalities))}")
+    print(f"Categorical cardinalities: {dict(zip(pipeline.cat_cols, pipeline.cardinalities))}")
     print(f"CatBoost: depth {CB_DEPTH} | lr {CB_LR} | max iters {CB_ITERATIONS} | time budget: {time_budget:.0f}s\n")
 
     model.fit(train_pool, eval_set=val_pool, callbacks=[_CBTimeBudget(time_budget)])
@@ -504,7 +566,7 @@ def train(df, train_idx, val_idx, time_budget, device, show):
     probe = CarPriceNet(pipeline.cardinalities, n_numeric=len(FeaturePipeline.NUMERIC))
     params_each = sum(p.numel() for p in probe.parameters())
     print(f"Device: {device} | rows: {len(df)} (train {len(train_idx)} / val {len(val_idx)})")
-    print(f"Categorical cardinalities: {dict(zip(CATEGORICAL, pipeline.cardinalities))}")
+    print(f"Categorical cardinalities: {dict(zip(pipeline.cat_cols, pipeline.cardinalities))}")
     print(f"Model params: {params_each:,} x {N_SEEDS} seed(s) | loss {LOSS}/{LOSS_SPACE} | "
           f"budget {time_budget:.0f}s/seed\n")
 
